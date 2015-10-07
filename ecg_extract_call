@@ -1,0 +1,130 @@
+#!/bin/bash -
+##
+## Extract VoIP-related stuff based on the parameters given.
+##
+##
+VERSION=2
+## 2 Revision Fri Sep  9 10:23:28 EDT 2011
+## Added -a flag to concatenate input files. Deleted combined files.
+##
+## 1 Original version: lindsey@e-c-group.com Tue Sep  6 15:51:27 EDT 2011
+##
+#########################
+export TMP=/tmp/`basename $0`.$$.$RANDOM
+export PROGRAM_NAME=`basename $0`
+
+warn() {
+  echo "$PROGRAM_NAME: $*" >&2
+}
+die() {
+  warn "$1"
+  rm $TMP.*
+  exit 2
+}
+
+#########################
+
+if [ ! "$1" ] || [ "$1" = "--help" ]; then
+cat << vEOF
+Usage:
+  $0 options inputfiles...
+
+This extract SIP signaling, then extracts RTP that appears to be related to
+the SDP found in that signaling.
+
+"inputfiles" are the set of PCAP files that may contain this call. They are
+scanned twice: once for finding the signaling, then a second time for
+extrdacting the RTP.
+
+Options:
+        -R <read filter>             Select source signaling packets
+                                     using this read (display) filter
+
+        -w <output file>             Write the captured data to an output
+                                     PCAP file. By default, PCAP output
+                                     is written to standard output.
+
+  -a                           Concatenate, rather than merge, the
+                                     input files.
+
+Example:
+  $0 -R 'sip contains 5146885111' -w calls_with_nick.pcap *.pcap
+
+Author: Mark R Lindsey, lindsey@e-c-group.com
+Version: $VERSION
+
+vEOF
+
+  exit 255
+fi
+##
+## Check dependencies
+for program in tcpdump tshark mergecap
+do
+  which $program >/dev/null || die "Cannot find executable $progarm in the PATH".
+done
+
+
+## Process command line arguments
+while [ "$1" ]
+do
+  case "$1" in
+    -R) read_filter_flag="$1" ; shift;  read_filter="$1" ; shift ;;
+    -w) output_file_flag="$1" ; shift ; output_file="$1"; shift ;;
+    -a) concatenate_flag="$1" ; shift ;;
+    *) break;;
+  esac
+done
+
+source_files="$@"
+
+##
+#####################
+##
+## First, grab the matching VoIP signaling (like SIP)
+##
+if [ "$concatenate_flag" ]; then
+  cat $source_files > $TMP.source_merged ||
+    die "cat failed concatenating source files"
+else
+  mergecap -w $TMP.source_merged $source_files ||
+    die "mergecap failed"
+fi
+
+tshark -r $TMP.source_merged -w $TMP.source_signaling $read_filter_flag "$read_filter" ||
+  die "tshark signaling extraction failed"
+
+if [ ! -s "$TMP.source_signaling" ]; then
+  die "No matching signaling packets found."
+fi
+
+
+## Extract the SDP signaling info out of the packets
+##
+rtp_capture_filter=`
+  tshark -r $TMP.source_signaling  -T fields  -e sdp.connection_info.address   -e sdp.media.port |
+  while read address port
+  do
+    ## many lines will have no addres or port.
+    if [ ! "$address"  ] || [ ! "$port" ]
+    then
+      continue
+    fi
+
+    [ "$output" ] && echo ' || '
+    echo  "( host $address && udp port $port )"
+    output=1
+  done
+`
+
+tcpdump -s 1514 -r $TMP.source_merged -w $TMP.rtp "$rtp_capture_filter" ||
+  warn "No matching RTP packets found."
+
+if [ ! -s  $TMP.rtp ]; then
+  warn "No matching RTP packets found -- output file does not exist, or is empty."
+fi
+
+## We really do need the merge-sort at this point.
+mergecap $output_file_flag  $output_file $TMP.rtp $TMP.source_signaling
+
+rm $TMP.*
